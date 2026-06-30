@@ -1,6 +1,6 @@
 // ===== CONFIG =====
 // Paste your Apps Script web app deployment URL here after setup.
-const API_URL = 'https://script.google.com/macros/s/AKfycbzMN8GEON7qzCHOgGWs8c4Jnv0_4oDGlJzKvjliKxl3_X8mWelBS0eCGlHD1bHqht5ecQ/exec';
+const API_URL = 'PASTE_YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE';
 
 // ===== ELEMENTS =====
 const video = document.getElementById('video');
@@ -62,15 +62,73 @@ shutterBtn.addEventListener('click', () => {
   captureCanvas.height = h;
   const ctx = captureCanvas.getContext('2d');
   ctx.drawImage(video, 0, 0, w, h);
-  lastImageDataUrl = captureCanvas.toDataURL('image/jpeg', 0.92);
+  const rawDataUrl = captureCanvas.toDataURL('image/jpeg', 0.95);
 
-  capturedPreview.src = lastImageDataUrl;
+  // Show the raw photo immediately for user feedback, but OCR runs on a
+  // preprocessed (upscaled + contrast-boosted) version for better accuracy.
+  capturedPreview.src = rawDataUrl;
   capturedPreview.style.display = 'block';
   video.style.display = 'none';
   controls.classList.add('hidden');
 
-  runOcr(lastImageDataUrl);
+  const processedDataUrl = preprocessForOcr(captureCanvas);
+  lastImageDataUrl = processedDataUrl;
+
+  runOcr(processedDataUrl);
 });
+
+// ===== IMAGE PREPROCESSING =====
+// Tesseract reads best on a high-contrast, upscaled, grayscale image.
+// Raw phone photos of small print are usually too low-contrast and too
+// small (in character-pixel-height terms) for it, even if they look fine
+// to a human eye. This step compensates for that.
+function preprocessForOcr(sourceCanvas) {
+  const srcW = sourceCanvas.width;
+  const srcH = sourceCanvas.height;
+
+  // Upscale small-print captures so character height is large enough
+  // for Tesseract to resolve detail (target ~2500px on the long edge).
+  const longEdge = Math.max(srcW, srcH);
+  const scale = longEdge < 2500 ? 2500 / longEdge : 1;
+  const outW = Math.round(srcW * scale);
+  const outH = Math.round(srcH * scale);
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outW;
+  outCanvas.height = outH;
+  const ctx = outCanvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(sourceCanvas, 0, 0, outW, outH);
+
+  // Grayscale + contrast stretch (normalize the histogram so faint print
+  // becomes much darker relative to the background).
+  const imageData = ctx.getImageData(0, 0, outW, outH);
+  const data = imageData.data;
+  const grays = new Uint8ClampedArray(outW * outH);
+
+  let min = 255, max = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    grays[p] = gray;
+    if (gray < min) min = gray;
+    if (gray > max) max = gray;
+  }
+
+  const range = Math.max(max - min, 1);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    // Stretch contrast across the full 0-255 range, then push it a bit
+    // further with a mild S-curve so text edges sharpen.
+    let v = ((grays[p] - min) / range) * 255;
+    v = v < 128
+      ? Math.max(0, v - (128 - v) * 0.15)
+      : Math.min(255, v + (v - 128) * 0.15);
+    data[i] = data[i + 1] = data[i + 2] = v;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  return outCanvas.toDataURL('image/jpeg', 0.95);
+}
 
 // ===== OCR =====
 async function runOcr(imageDataUrl) {
@@ -87,7 +145,10 @@ async function runOcr(imageDataUrl) {
         } else {
           progressLabel.textContent = humanizeStatus(m.status);
         }
-      }
+      },
+      // PSM 11 ("sparse text") works better than the default for labels,
+      // spec sheets, and other layouts that aren't a flowing paragraph.
+      tessedit_pageseg_mode: '11'
     });
 
     const text = result.data.text.trim();
@@ -123,9 +184,13 @@ function showResult(text, confidence) {
   ocrTextEl.value = text || '';
 
   if (!text) {
-    sendStatus.textContent = 'No text detected — try retaking with better lighting or framing.';
+    sendStatus.textContent = 'No text detected — move closer so the print fills the frame, and retake.';
     sendStatus.style.color = 'var(--red)';
     sendBtn.disabled = true;
+  } else if (confidence < 50) {
+    sendStatus.textContent = 'Low confidence — for small print, fill the frame with just the text and avoid glare, then retake.';
+    sendStatus.style.color = 'var(--red)';
+    sendBtn.disabled = false;
   } else {
     sendStatus.textContent = '';
     sendBtn.disabled = false;
